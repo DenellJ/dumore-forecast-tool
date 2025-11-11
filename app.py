@@ -20,7 +20,7 @@ DUMORE_BLUE = "#1B2A7A"
 DUMORE_YELLOW = "#F8C700"
 # -------------------------------
 
-# -------------- STYLING --------------
+# -------------- STYLING & PAGE --------------
 
 st.set_page_config(
     page_title="Dumore Demand Forecasting Tool",
@@ -41,7 +41,6 @@ st.markdown(
             padding-bottom: 2rem;
         }}
 
-        /* Global text blue */
         h1, h2, h3, h4, h5, h6,
         label,
         p,
@@ -50,7 +49,6 @@ st.markdown(
             color: {DUMORE_BLUE} !important;
         }}
 
-        /* Primary buttons */
         .stButton>button,
         .stDownloadButton>button {{
             background: {DUMORE_BLUE} !important;
@@ -63,7 +61,6 @@ st.markdown(
             transition: all 0.25s ease-in-out;
         }}
 
-        /* Hover gradient, keep white text */
         .stButton>button:hover,
         .stDownloadButton>button:hover {{
             background: linear-gradient(90deg, {DUMORE_YELLOW}, {DUMORE_BLUE}) !important;
@@ -72,25 +69,21 @@ st.markdown(
             box-shadow: 0 6px 16px rgba(0,0,0,0.16);
         }}
 
-        /* File uploader label */
         .stFileUploader label div {{
             color: {DUMORE_BLUE} !important;
             font-weight: 500 !important;
         }}
 
-        /* Spinner text */
         div[data-testid="stSpinner"] p {{
             color: {DUMORE_BLUE} !important;
             font-weight: 600 !important;
         }}
 
-        /* Success / error text */
         div[data-testid="stSuccess"] p,
         div[data-testid="stError"] p {{
             color: {DUMORE_BLUE} !important;
         }}
 
-        /* DataFrame frame */
         .stDataFrame {{
             border: 1px solid {DUMORE_BLUE};
             border-radius: 8px;
@@ -106,7 +99,7 @@ st.markdown(
 def parse_period_to_date(label: str):
     """
     Parse headers like 'January  (2020) - Quantity' into Timestamp('2020-01-01').
-    Adjust here if your actual format differs.
+    Adjust this if your actual headers differ.
     """
     if not isinstance(label, str):
         return None
@@ -132,7 +125,7 @@ def parse_period_to_date(label: str):
 
 def prepare_long(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Reshape to:
+    Reshape wide table to:
     Item No. | Item Description | Date | Quantity
     """
     id_candidates = ["Item No.", "Item No", "Item", "Item Code"]
@@ -172,7 +165,7 @@ def prepare_long(df: pd.DataFrame) -> pd.DataFrame:
 
 def forecast_series_sarima(ts: pd.Series, steps: int) -> np.ndarray:
     """
-    SARIMA(1,1,1)(1,1,1,12) per item with safe fallbacks.
+    Faster SARIMA per item with safe fallbacks.
     """
     ts = ts.sort_index().asfreq("MS")
     valid_ts = ts.dropna()
@@ -185,14 +178,15 @@ def forecast_series_sarima(ts: pd.Series, steps: int) -> np.ndarray:
         return np.full(steps, max(mean_val, 0.0))
 
     try:
+        # Slightly lighter seasonal spec + maxiter cap for speed
         model = SARIMAX(
-            ts,
+            valid_ts,
             order=(1, 1, 1),
-            seasonal_order=(1, 1, 1, SEASONAL_PERIOD),
+            seasonal_order=(0, 1, 1, SEASONAL_PERIOD),
             enforce_stationarity=False,
             enforce_invertibility=False,
         )
-        result = model.fit(disp=False)
+        result = model.fit(disp=False, maxiter=40)
         fc = result.forecast(steps=steps)
         fc = fc.fillna(valid_ts.mean())
         return np.array([max(float(v), 0.0) for v in fc])
@@ -203,8 +197,8 @@ def forecast_series_sarima(ts: pd.Series, steps: int) -> np.ndarray:
 
 def build_forecast_table(raw_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Build wide table:
-    Item No. | Item Description | [Next 13 months forecast columns...]
+    Build:
+    Item No. | Item Description | [Next 13 months of forecasts...]
     """
     long_df = prepare_long(raw_df)
 
@@ -221,25 +215,45 @@ def build_forecast_table(raw_df: pd.DataFrame) -> pd.DataFrame:
 
     rows = []
 
-    for item_no, grp in long_df.groupby("Item No."):
+    # Progress bar for UX
+    items = list(long_df["Item No."].unique())
+    progress = st.progress(0.0, text="Running forecasts per item...")
+
+    for i, item_no in enumerate(items, start=1):
+        grp = long_df[long_df["Item No."] == item_no]
         desc = grp["Item Description"].iloc[0]
         ts = grp.set_index("Date")["Quantity"].astype(float)
 
         fc_vals = forecast_series_sarima(ts, FORECAST_STEPS)
 
-        row = {
-            "Item No.": item_no,
-            "Item Description": desc,
-        }
-
+        row = {"Item No.": item_no, "Item Description": desc}
         for dt, v in zip(future_index, fc_vals):
             col_name = f"{dt.strftime('%B')} ({dt.year}) - Forecast"
             row[col_name] = round(float(v), ROUND_DECIMALS)
 
         rows.append(row)
 
+        progress.progress(i / len(items), text=f"Running forecasts... ({i}/{len(items)})")
+
+    progress.empty()
+
     forecast_df = pd.DataFrame(rows)
     return forecast_df.sort_values("Item No.").reset_index(drop=True)
+
+
+# ---------- CACHE WRAPPER (KEY FOR SPEED) ----------
+
+@st.cache_data(show_spinner=False)
+def build_forecast_table_cached(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+    """
+    Cached wrapper:
+    - Reads Excel from bytes
+    - Builds forecast table
+    Cache key = file content + sheet name.
+    """
+    raw_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name)
+    return build_forecast_table(raw_df)
+
 
 # -------------- APP LAYOUT --------------
 
@@ -277,7 +291,6 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # --- Upload ---
     uploaded_file = st.file_uploader(
         "Upload Excel file (.xlsx) with historical sales",
         type=["xlsx"],
@@ -291,24 +304,21 @@ def main():
                 xls.sheet_names,
             )
 
-            # Generate button
             if st.button("Generate Forecast"):
                 with st.spinner("Calculating SARIMA forecasts..."):
-                    raw_df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
-                    forecast_df = build_forecast_table(raw_df)
-
-                # Store in session so it persists after rerun
+                    file_bytes = uploaded_file.getvalue()
+                    forecast_df = build_forecast_table_cached(file_bytes, sheet_name)
                 st.session_state["forecast_df"] = forecast_df
 
         except Exception as e:
             st.error(f"Error: {e}")
 
-    # --- Show results & download if available ---
+    # Show results if available
     if "forecast_df" in st.session_state:
         forecast_df = st.session_state["forecast_df"]
 
         st.success("Forecast generated successfully.")
-        st.dataframe(forecast_df.head(20))
+        st.dataframe(forecast_df.head(50))
 
         # Build Excel in memory
         output = io.BytesIO()
