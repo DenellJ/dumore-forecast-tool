@@ -50,7 +50,7 @@ st.markdown(
             color: {DUMORE_BLUE} !important;
         }}
 
-        /* Primary buttons (Generate / Download) */
+        /* Primary buttons */
         .stButton>button,
         .stDownloadButton>button {{
             background: {DUMORE_BLUE} !important;
@@ -105,41 +105,20 @@ st.markdown(
 
 def parse_period_to_date(label: str):
     """
-    Convert header text into a Timestamp.
-    Robust to patterns like:
-      'January  (2020) - Quantity'
-      'Jan 2020 - Quantity'
-      'Jan-20'
-    Returns None if no obvious month/year.
+    Parse headers like 'January  (2020) - Quantity' into Timestamp('2020-01-01').
+    Adjust here if your actual format differs.
     """
     if not isinstance(label, str):
         return None
 
     s = label.strip()
-
-    # 1) 'MonthName (YYYY)'
     m = re.search(r'([A-Za-z]+)\s*\((\d{4})\)', s)
-    if m:
-        month_name, year_str = m.group(1), m.group(2)
-    else:
-        # 2) 'MonthName YYYY'
-        m = re.search(r'([A-Za-z]+)\s+(\d{4})', s)
-        if m:
-            month_name, year_str = m.group(1), m.group(2)
-        else:
-            # 3) 'MonthName-YY' or 'MonthName-YYYY'
-            m = re.search(r'([A-Za-z]+)[\s\-_]+(\d{2,4})', s)
-            if m:
-                month_name, year_str = m.group(1), m.group(2)
-            else:
-                return None
+    if not m:
+        return None
 
-    # Normalize year
+    month_name, year_str = m.group(1), m.group(2)
     year = int(year_str)
-    if year < 100:  # handle YY format
-        year = 2000 + year if year < 50 else 1900 + year
 
-    # Normalize month
     try:
         month_num = pd.to_datetime(month_name, format="%B").month
     except ValueError:
@@ -153,7 +132,7 @@ def parse_period_to_date(label: str):
 
 def prepare_long(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Melt wide table into long:
+    Reshape to:
     Item No. | Item Description | Date | Quantity
     """
     id_candidates = ["Item No.", "Item No", "Item", "Item Code"]
@@ -169,21 +148,11 @@ def prepare_long(df: pd.DataFrame) -> pd.DataFrame:
 
     id_cols = [id_col, desc_col]
 
-    # Time-series columns = contain 'Quantity'
     value_cols = [c for c in df.columns if "Quantity" in str(c) and c not in id_cols]
-
-    # Fallback: any column (not ID) that can be parsed as Month/Year
-    if not value_cols:
-        for c in df.columns:
-            if c in id_cols:
-                continue
-            if parse_period_to_date(c) is not None:
-                value_cols.append(c)
-
     if not value_cols:
         raise ValueError(
-            "No valid monthly columns found. "
-            "Ensure your headers include a month & year, e.g. 'January  (2020) - Quantity'."
+            "No monthly 'Quantity' columns found. "
+            "Expected headers like 'January  (2020) - Quantity'."
         )
 
     long_df = df.melt(
@@ -203,7 +172,7 @@ def prepare_long(df: pd.DataFrame) -> pd.DataFrame:
 
 def forecast_series_sarima(ts: pd.Series, steps: int) -> np.ndarray:
     """
-    Fit SARIMA to single-item series with safe fallbacks.
+    SARIMA(1,1,1)(1,1,1,12) per item with safe fallbacks.
     """
     ts = ts.sort_index().asfreq("MS")
     valid_ts = ts.dropna()
@@ -234,7 +203,7 @@ def forecast_series_sarima(ts: pd.Series, steps: int) -> np.ndarray:
 
 def build_forecast_table(raw_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Return wide table:
+    Build wide table:
     Item No. | Item Description | [Next 13 months forecast columns...]
     """
     long_df = prepare_long(raw_df)
@@ -275,6 +244,7 @@ def build_forecast_table(raw_df: pd.DataFrame) -> pd.DataFrame:
 # -------------- APP LAYOUT --------------
 
 def main():
+    # Logo + title
     cols = st.columns([1, 3])
     with cols[0]:
         try:
@@ -307,6 +277,7 @@ def main():
         unsafe_allow_html=True,
     )
 
+    # --- Upload ---
     uploaded_file = st.file_uploader(
         "Upload Excel file (.xlsx) with historical sales",
         type=["xlsx"],
@@ -320,32 +291,41 @@ def main():
                 xls.sheet_names,
             )
 
+            # Generate button
             if st.button("Generate Forecast"):
                 with st.spinner("Calculating SARIMA forecasts..."):
                     raw_df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
                     forecast_df = build_forecast_table(raw_df)
 
-                st.success("Forecast generated successfully.")
-                st.dataframe(forecast_df.head(20))
-
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                    forecast_df.to_excel(
-                        writer,
-                        index=False,
-                        sheet_name="Forecast_13m",
-                    )
-                output.seek(0)
-
-                st.download_button(
-                    label="Download Forecast Excel",
-                    data=output,
-                    file_name="Sales_Forecast_SARIMA_13m.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+                # Store in session so it persists after rerun
+                st.session_state["forecast_df"] = forecast_df
 
         except Exception as e:
             st.error(f"Error: {e}")
+
+    # --- Show results & download if available ---
+    if "forecast_df" in st.session_state:
+        forecast_df = st.session_state["forecast_df"]
+
+        st.success("Forecast generated successfully.")
+        st.dataframe(forecast_df.head(20))
+
+        # Build Excel in memory
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            forecast_df.to_excel(
+                writer,
+                index=False,
+                sheet_name="Forecast_13m",
+            )
+        output.seek(0)
+
+        st.download_button(
+            label="Download Forecast Excel",
+            data=output,
+            file_name="Sales_Forecast_SARIMA_13m.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 if __name__ == "__main__":
     main()
