@@ -11,16 +11,19 @@ warnings.filterwarnings("ignore")
 
 # ------------ CONFIG ------------
 FORECAST_STEPS = 13
-MIN_HISTORY_POINTS = 12       # below this, fallback to mean
+MIN_HISTORY_POINTS = 12       # below this, fallback method
 SEASONAL_PERIOD = 12          # monthly seasonality
 ROUND_DECIMALS = 2            # forecasts rounded to 2dp
+
+# To avoid timeouts on Render:
+MAX_FULL_SARIMA_ITEMS = 250   # use SARIMA for up to this many items; rest use fast fallback
 
 # Brand colors
 DUMORE_BLUE = "#1B2A7A"
 DUMORE_YELLOW = "#F8C700"
 # -------------------------------
 
-# -------------- STYLING & PAGE --------------
+# -------------- PAGE & STYLES --------------
 
 st.set_page_config(
     page_title="Dumore Demand Forecasting Tool",
@@ -163,22 +166,36 @@ def prepare_long(df: pd.DataFrame) -> pd.DataFrame:
     return long_df.rename(columns={id_col: "Item No.", desc_col: "Item Description"})
 
 
-def forecast_series_sarima(ts: pd.Series, steps: int) -> np.ndarray:
+def fast_fallback_forecast(ts: pd.Series, steps: int) -> np.ndarray:
     """
-    Faster SARIMA per item with safe fallbacks.
+    Fast non-SARIMA fallback:
+    - If >= 12 points: use mean of last 12 months.
+    - Else: use mean of all available.
+    """
+    ts = ts.dropna()
+    if len(ts) == 0:
+        return np.zeros(steps)
+
+    if len(ts) >= 12:
+        base = float(ts.tail(12).mean())
+    else:
+        base = float(ts.mean())
+
+    base = max(base, 0.0)
+    return np.full(steps, base)
+
+
+def sarima_forecast(ts: pd.Series, steps: int) -> np.ndarray:
+    """
+    SARIMA for one series with safeguards.
     """
     ts = ts.sort_index().asfreq("MS")
     valid_ts = ts.dropna()
 
-    if len(valid_ts) == 0:
-        return np.zeros(steps)
-
     if len(valid_ts) < MIN_HISTORY_POINTS:
-        mean_val = float(valid_ts.mean())
-        return np.full(steps, max(mean_val, 0.0))
+        return fast_fallback_forecast(valid_ts, steps)
 
     try:
-        # Slightly lighter seasonal spec + maxiter cap for speed
         model = SARIMAX(
             valid_ts,
             order=(1, 1, 1),
@@ -191,14 +208,15 @@ def forecast_series_sarima(ts: pd.Series, steps: int) -> np.ndarray:
         fc = fc.fillna(valid_ts.mean())
         return np.array([max(float(v), 0.0) for v in fc])
     except Exception:
-        mean_val = float(valid_ts.mean())
-        return np.full(steps, max(mean_val, 0.0))
+        return fast_fallback_forecast(valid_ts, steps)
 
 
 def build_forecast_table(raw_df: pd.DataFrame) -> pd.DataFrame:
     """
     Build:
-    Item No. | Item Description | [Next 13 months of forecasts...]
+    Item No. | Item Description | [Next 13 months forecast columns...]
+    - Uses SARIMA for first N items (configurable).
+    - Uses fast fallback for the rest (to avoid timeouts).
     """
     long_df = prepare_long(raw_df)
 
@@ -214,17 +232,19 @@ def build_forecast_table(raw_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     rows = []
+    all_items = list(long_df["Item No."].unique())
+    total_items = len(all_items)
 
-    # Progress bar for UX
-    items = list(long_df["Item No."].unique())
-    progress = st.progress(0.0, text="Running forecasts per item...")
-
-    for i, item_no in enumerate(items, start=1):
+    for idx, item_no in enumerate(all_items):
         grp = long_df[long_df["Item No."] == item_no]
         desc = grp["Item Description"].iloc[0]
         ts = grp.set_index("Date")["Quantity"].astype(float)
 
-        fc_vals = forecast_series_sarima(ts, FORECAST_STEPS)
+        # Decide whether to use SARIMA or fast fallback
+        if idx < MAX_FULL_SARIMA_ITEMS:
+            fc_vals = sarima_forecast(ts, FORECAST_STEPS)
+        else:
+            fc_vals = fast_fallback_forecast(ts, FORECAST_STEPS)
 
         row = {"Item No.": item_no, "Item Description": desc}
         for dt, v in zip(future_index, fc_vals):
@@ -233,32 +253,25 @@ def build_forecast_table(raw_df: pd.DataFrame) -> pd.DataFrame:
 
         rows.append(row)
 
-        progress.progress(i / len(items), text=f"Running forecasts... ({i}/{len(items)})")
-
-    progress.empty()
-
     forecast_df = pd.DataFrame(rows)
-    return forecast_df.sort_values("Item No.").reset_index(drop=True)
+    forecast_df = forecast_df.sort_values("Item No.").reset_index(drop=True)
+    return forecast_df
 
-
-# ---------- CACHE WRAPPER (KEY FOR SPEED) ----------
 
 @st.cache_data(show_spinner=False)
 def build_forecast_table_cached(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
     """
-    Cached wrapper:
-    - Reads Excel from bytes
+    Cached:
+    - Reads Excel
     - Builds forecast table
-    Cache key = file content + sheet name.
     """
     raw_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name)
     return build_forecast_table(raw_df)
 
-
 # -------------- APP LAYOUT --------------
 
 def main():
-    # Logo + title
+    # Header
     cols = st.columns([1, 3])
     with cols[0]:
         try:
@@ -270,7 +283,8 @@ def main():
             f"""
             <h1 style="margin-bottom:0;">Dumore Demand Forecasting Tool</h1>
             <p style="font-size:0.95rem; margin-top:0.2rem;">
-            SARIMA-based 13-month forecast per item.
+            SARIMA-based 13-month forecast per item
+            (optimized for web performance).
             </p>
             """,
             unsafe_allow_html=True,
@@ -286,6 +300,7 @@ def main():
         <p style="font-size:0.9rem;">
         Upload your historical sales file and generate an Excel report with
         the next {FORECAST_STEPS} months of forecasted quantities for every item.
+        For large catalogs, core items use SARIMA; others use a fast statistical fallback.
         </p>
         """,
         unsafe_allow_html=True,
@@ -305,22 +320,22 @@ def main():
             )
 
             if st.button("Generate Forecast"):
-                with st.spinner("Calculating SARIMA forecasts..."):
+                with st.spinner("Calculating forecasts..."):
                     file_bytes = uploaded_file.getvalue()
                     forecast_df = build_forecast_table_cached(file_bytes, sheet_name)
+
                 st.session_state["forecast_df"] = forecast_df
 
         except Exception as e:
             st.error(f"Error: {e}")
 
-    # Show results if available
+    # Show results
     if "forecast_df" in st.session_state:
         forecast_df = st.session_state["forecast_df"]
 
         st.success("Forecast generated successfully.")
         st.dataframe(forecast_df.head(50))
 
-        # Build Excel in memory
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             forecast_df.to_excel(
